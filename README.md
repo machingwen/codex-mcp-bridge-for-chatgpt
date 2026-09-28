@@ -137,6 +137,28 @@ Use remote management only on a private LAN or private VPN that you control. See
 - These controls are policy boundaries, not operating-system isolation. Use a separate OS user, container, VM, or disposable project copy when stronger isolation is required.
 - Execution uses the selected Codex CLI through App Server. Compatibility depends on the public protocol and required features, without a bridge-owned version allowlist.
 
+### Keep environments outside registered projects
+
+When setting up a new machine, create Python/Conda environments and dependency caches **outside registered project folders**. Prefer `$HOME/conda-envs/<project>` for environments, `$HOME/conda-pkgs` for Conda packages, and `$HOME/.cache/pip` for pip's cache.
+
+For example, to create a new environment (replace `my-project` with your project name):
+
+```bash
+mkdir -p "$HOME/conda-envs" "$HOME/conda-pkgs" "$HOME/.cache/pip"
+export CONDA_PKGS_DIRS="$HOME/conda-pkgs"
+export PIP_CACHE_DIR="$HOME/.cache/pip"
+conda create --prefix "$HOME/conda-envs/my-project" python=3.11
+conda activate "$HOME/conda-envs/my-project"
+```
+
+Use these cache settings for subsequent package installations too. Run project code with the external environment's Python interpreter.
+
+Environments and package caches can include public CA certificate files ending in `.pem`. A filename-based sensitive-file preflight can flag these files when they are inside a registered project, preventing Codex startup even when the bridge health check succeeds. Keep the scanner enabled; do not delete certificates to pass the scan. Review flagged paths and use a narrowly reviewed fix when needed.
+
+Do not blindly move existing environments: installed packages can contain absolute paths. Leave working environments intact unless a separate migration is planned and verified.
+
+Carry this rule into each project's `AGENTS.md`: create new environments and dependency caches outside the project, preserve existing environments, and keep the sensitive-file scanner enabled.
+
 ## Documentation
 
 - [Setup and settings](docs/setup.md) — macOS server/client setup, Windows/Linux Node.js setup, ChatGPT connection, and every user-facing setting
