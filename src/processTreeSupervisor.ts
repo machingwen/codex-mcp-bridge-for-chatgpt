@@ -105,6 +105,8 @@ export class SupervisedProcessTreeRegistry {
     tree.rootExited ||= snapshot.rootExited === true;
     for (const entry of snapshot.processes) {
       if (!validProcessIdentity(entry)) continue;
+      if (!tree.captured.has(entry.pid) &&
+          tree.captured.size >= MAX_SUPERVISED_PROCESSES_PER_TREE) continue;
       tree.captured.set(entry.pid, { ...entry });
     }
   }
@@ -252,6 +254,18 @@ function observeTree(
   rows: readonly ProcessTableEntry[]
 ): void {
   const current = new Map(rows.map((entry) => [entry.pid, entry] as const));
+  // A successful process-table read is a complete snapshot. Reclaim exited
+  // or reused PIDs before applying the live-tree bound. Keep every verified
+  // orphan that still appears in this snapshot, even if its root has exited.
+  for (const [pid, captured] of tree.captured) {
+    const observed = current.get(pid);
+    if (!observed || isZombie(observed) ||
+        observed.processGroupId !== captured.processGroupId ||
+        (captured.startedAt !== undefined &&
+         observed.startedAt !== captured.startedAt)) {
+      tree.captured.delete(pid);
+    }
+  }
   const children = new Map<number, ProcessTableEntry[]>();
   for (const row of rows) {
     if (isZombie(row)) continue;

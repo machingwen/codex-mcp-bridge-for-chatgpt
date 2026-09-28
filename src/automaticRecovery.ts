@@ -40,6 +40,19 @@ export function automaticRecoveryKey(kind: AutomaticRecoveryKind, identity: unkn
 export class AutomaticRecoveryStore {
   constructor(private readonly db: Database.Database) {}
 
+  blockedKeys(): Set<string> {
+    return new Set((this.db.prepare(
+      "SELECT recovery_key FROM automatic_recovery WHERE state='blocked'"
+    ).all() as Array<{ recovery_key: string }>).map(row => row.recovery_key));
+  }
+
+  blockedRecheckIdentityKeys(): Set<string> {
+    return new Set((this.db.prepare(`SELECT incident.identity_key FROM automatic_recovery_incidents incident
+      JOIN automatic_recovery recovery ON recovery.recovery_key=incident.recovery_key
+      WHERE incident.active=1 AND recovery.state='blocked'`)
+      .all() as Array<{ identity_key: string }>).map(row => row.identity_key));
+  }
+
   get(key: string): AutomaticRecoveryRecord | undefined {
     const row = this.db.prepare("SELECT * FROM automatic_recovery WHERE recovery_key=?").get(key);
     return row ? this.decode(row as Record<string, unknown>) : undefined;
@@ -183,9 +196,11 @@ export class AutomaticRecoveryController {
   private pending?: Promise<void>;
   private closed = false;
   private cursor = "";
+  private fullScanScheduled = false;
+  private readonly scheduledAgents = new Set<string>();
   readonly now: () => number;
   constructor(private readonly store: AutomaticRecoveryStore, private readonly options: {
-    candidates: () => AutomaticRecoveryCandidate[];
+    candidates: (agentId?: string) => AutomaticRecoveryCandidate[] | Promise<AutomaticRecoveryCandidate[]>;
     attempt: (candidate: AutomaticRecoveryCandidate) => Promise<AutomaticRecoveryResult>;
     changed?: () => void; enabled?: () => boolean; now?: () => number; intervalMs?: number;
   }) { this.now = options.now || (() => Date.now()); }
@@ -198,15 +213,29 @@ export class AutomaticRecoveryController {
     this.schedule();
   }
 
-  schedule(): void {
-    if (this.closed || this.scheduled) return;
-    this.scheduled = setTimeout(() => { this.scheduled = undefined; void this.sweep(); }, 100);
+  schedule(agentId?: string): void {
+    if (this.closed) return;
+    if (agentId) this.scheduledAgents.add(agentId);
+    else this.fullScanScheduled = true;
+    if (this.scheduled) return;
+    this.scheduled = setTimeout(() => {
+      this.scheduled = undefined;
+      const full = this.fullScanScheduled;
+      const agents = [...this.scheduledAgents];
+      this.fullScanScheduled = false;
+      this.scheduledAgents.clear();
+      void (async () => {
+        await this.pending;
+        if (full) await this.sweep();
+        else for (const id of agents) await this.sweep(undefined, id);
+      })();
+    }, 100);
     this.scheduled.unref();
   }
 
-  sweep(jobId?: string): Promise<void> {
+  sweep(jobId?: string, agentId?: string): Promise<void> {
     if (this.closed) return Promise.resolve();
-    return this.pending ||= this.runSweep(jobId).catch(error => {
+    return this.pending ||= this.runSweep(jobId, agentId).catch(error => {
       this.lastError = error instanceof Error ? error.message : String(error);
     }).finally(() => { this.pending = undefined; });
   }
@@ -223,11 +252,13 @@ export class AutomaticRecoveryController {
     await this.pending;
   }
 
-  private async runSweep(jobId?: string): Promise<void> {
+  private async runSweep(jobId?: string, agentId?: string): Promise<void> {
     if (this.options.enabled?.() === false) return;
-    const available = this.options.candidates();
+    const available = await this.options.candidates(agentId);
     let keys = new Set(available.map(candidate => candidate.key));
     for (const record of this.store.list()) {
+      if (agentId && record.agentId !== agentId) continue;
+      if (jobId && record.jobId !== jobId) continue;
       if (record.state === "retrying" && !keys.has(record.key)) {
         this.store.finish(record.key,record.attempts,{resolved:false,reason:"work-changed",retryable:false},this.now());
         this.options.changed?.();
@@ -252,7 +283,7 @@ export class AutomaticRecoveryController {
       this.options.changed?.();
       // One verified shared-worker release can settle several initial
       // candidates. Do not invent another attempt for a peer already released.
-      keys = new Set(this.options.candidates().map(current => current.key));
+      keys = new Set((await this.options.candidates(agentId)).map(current => current.key));
     }
   }
 }

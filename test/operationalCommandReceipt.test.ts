@@ -235,7 +235,7 @@ describe("operational command receipts", () => {
 
     try {
       const store = new BridgeStateStore({ file });
-      expect(store.schemaVersion).toBe(27);
+      expect(store.schemaVersion).toBe(28);
       store.close();
       const upgraded = new Database(file, { readonly: true });
       const names = (upgraded.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as Array<{ name: string }>)
@@ -247,7 +247,7 @@ describe("operational command receipts", () => {
       expect(upgraded.pragma("integrity_check", { simple: true })).toBe("ok");
       expect(upgraded.pragma("foreign_key_check")).toEqual([]);
       upgraded.close();
-      expect(existsSync(`${file}.pre-v23-to-v27.sqlite`)).toBe(true);
+      expect(existsSync(`${file}.pre-v23-to-v28.sqlite`)).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -291,7 +291,7 @@ describe("operational command receipts", () => {
 
     try {
       const store = new BridgeStateStore({ file });
-      expect(store.schemaVersion).toBe(27);
+      expect(store.schemaVersion).toBe(28);
       expect(store.getMeta("schema_v25_operational_command_receipts"))
         .toBe("durable-command-receipts-v1");
       expect(store.getMeta("schema_v27_decision_card_retirement"))
@@ -313,17 +313,17 @@ describe("operational command receipts", () => {
       expect(migrated.pragma("integrity_check", { simple: true })).toBe("ok");
       expect(migrated.pragma("foreign_key_check")).toEqual([]);
       migrated.close();
-      expect(existsSync(`${file}.pre-v24-to-v27.sqlite`)).toBe(true);
+      expect(existsSync(`${file}.pre-v24-to-v28.sqlite`)).toBe(true);
 
-      const source = new Database(`${file}.pre-v24-to-v27.sqlite`, { readonly: true });
+      const source = new Database(`${file}.pre-v24-to-v28.sqlite`, { readonly: true });
       expect(source.prepare("SELECT COUNT(*) AS count FROM decision_submissions").get())
         .toEqual({ count: 1 });
       source.close();
 
       const restoredFile = path.join(root, "restored.sqlite");
-      copyFileSync(`${file}.pre-v24-to-v27.sqlite`, restoredFile);
+      copyFileSync(`${file}.pre-v24-to-v28.sqlite`, restoredFile);
       const restored = new BridgeStateStore({ file: restoredFile });
-      expect(restored.schemaVersion).toBe(27);
+      expect(restored.schemaVersion).toBe(28);
       restored.close();
       const backup = new Database(restoredFile, { readonly: true });
       expect(backup.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='decision_submissions'").get())

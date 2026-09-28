@@ -1,13 +1,42 @@
 import { mkdtempSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { BridgeStateStore } from "../src/stateStore.js";
 import { AutomaticRecoveryController, automaticRecoveryKey } from "../src/automaticRecovery.js";
 
 const candidate = {key:automaticRecoveryKey("recheck",["agent-a",1]),scopeId:"scope-a",agentId:"agent-a",jobId:"job-a",kind:"recheck" as const};
 
 describe("bounded automatic recovery", () => {
+  it("surveys a changed Agent without reconciling another Agent's pending incident", async () => {
+    vi.useFakeTimers();
+    const state = new BridgeStateStore({ file: ":memory:" });
+    const other = { ...candidate, key: automaticRecoveryKey("recheck", ["agent-b", 1]),
+      agentId: "agent-b" };
+    state.automaticRecovery.begin(candidate, 1_000);
+    state.automaticRecovery.begin(other, 1_000);
+    const surveyed: Array<string | undefined> = [];
+    const controller = new AutomaticRecoveryController(state.automaticRecovery, {
+      candidates: agentId => { surveyed.push(agentId); return []; },
+      attempt: async () => ({ resolved: false, reason: "unused" })
+    });
+    try {
+      controller.schedule(candidate.agentId);
+      await vi.advanceTimersByTimeAsync(120);
+      expect(surveyed).toEqual([candidate.agentId]);
+      expect(state.automaticRecovery.get(candidate.key)?.state).toBe("blocked");
+      expect(state.automaticRecovery.get(other.key)?.state).toBe("retrying");
+      controller.schedule();
+      await vi.advanceTimersByTimeAsync(120);
+      expect(surveyed).toEqual([candidate.agentId, undefined]);
+      expect(state.automaticRecovery.get(other.key)?.state).toBe("blocked");
+    } finally {
+      await controller.close();
+      state.close();
+      vi.useRealTimers();
+    }
+  });
+
   it("persists attempts before dispatch, respects backoff across restart, and stops after three unconfirmed checks", async () => {
     const file = path.join(mkdtempSync(path.join(tmpdir(),"bridge-recovery-")),"state.sqlite");
     let state = new BridgeStateStore({file}), now=1000, calls=0;
