@@ -29,6 +29,34 @@ describe("supervised process table observation", () => {
     expect(await registry.cleanupAll(0)).toBe(false);
     expect(registry.size).toBe(1);
   });
+
+  it.skipIf(process.platform === "win32")(
+    "reclaims verified exited children without exhausting a live tree's ledger",
+    async () => {
+      const pid = 999_980;
+      const identity = { pid, processGroupId: pid };
+      const root = { ...identity, parentPid: 1, state: "S", startedAt: "root" };
+      let rows = [root];
+      const registry = new SupervisedProcessTreeRegistry(async () => rows);
+      await registry.register(identity);
+      for (let batch = 0; batch < 41; batch += 1) {
+        rows = [root, ...Array.from({ length: 100 }, (_, index) => ({
+          pid: 800_000 + batch * 100 + index, parentPid: pid,
+          processGroupId: pid, state: "S", startedAt: `${batch}:${index}`
+        }))];
+        await registry.refresh();
+        expect(registry.capturedProcessCount).toBe(101);
+      }
+      rows = [root];
+      await registry.refresh();
+      expect(registry.capturedProcessCount).toBe(1);
+      rows = [root, { pid: 899_999, parentPid: pid, processGroupId: pid,
+        state: "S", startedAt: "next" }];
+      await registry.refresh();
+      expect(registry.capturedProcessCount).toBe(2);
+      registry.forget(identity);
+    }
+  );
   it.skipIf(process.platform === "win32")(
     "settles a completed probe across the 1.0 to 1.25 second pause boundary",
     async () => {

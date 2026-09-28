@@ -179,6 +179,43 @@ describe("CodexJobRegistry persistence", () => {
     }
   });
 
+  it("keeps progress notifications off the automatic recovery survey", async () => {
+    vi.useFakeTimers();
+    const root = temporaryRoot();
+    const registry = persistentRegistry(root, path.join(root, "state.sqlite"));
+    let surveys = 0;
+    let emitProgress: ((progress: CodexProgress) => void) | undefined;
+    let complete: (value: ToolResult) => void = () => undefined;
+    try {
+      registry.configureAutomaticRecovery({
+        candidates: () => { surveys += 1; return []; },
+        attempt: async () => ({ resolved: false, reason: "unused" }),
+        intervalMs: 60_000
+      });
+      const job = registry.start(jobInput(root), async progress => {
+        emitProgress = progress;
+        return new Promise<ToolResult>(resolve => { complete = resolve; });
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(150);
+      const beforeProgress = surveys;
+      for (let index = 0; index < 50; index += 1) {
+        emitProgress?.({ progress: index / 50 });
+      }
+      await vi.advanceTimersByTimeAsync(150);
+      expect(surveys).toBe(beforeProgress);
+      complete(result("progress-without-survey"));
+      await job.promise;
+      await vi.advanceTimersByTimeAsync(150);
+      expect(surveys).toBeGreaterThan(beforeProgress);
+    } finally {
+      await registry.closeThreadConnections();
+      registry.admissionStateStore.close();
+      vi.useRealTimers();
+    }
+  });
+
   it("bounds simultaneous Dashboard and model terminal watchers under public-event load", async () => {
     const root = temporaryRoot();
     const registry = persistentRegistry(root, path.join(root, "state.sqlite"));

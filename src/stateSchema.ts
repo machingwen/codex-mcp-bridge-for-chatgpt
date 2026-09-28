@@ -1,9 +1,9 @@
 /**
  * Schema 19 remains the immutable released base DDL used by its recorded
- * migration. Fresh databases apply the v20 through v27 projections below in the
+ * migration. Fresh databases apply the v20 through v28 projections below in the
  * same transaction; older databases follow the append-only migration catalog.
  */
-export const CURRENT_STATE_SCHEMA_VERSION = "27";
+export const CURRENT_STATE_SCHEMA_VERSION = "28";
 
 export const CURRENT_STATE_SCHEMA = `
   CREATE TABLE scopes (
@@ -597,4 +597,10 @@ export const V27_DECISION_CARD_RETIREMENT_MIGRATION_SCHEMA = `
   DROP TABLE decision_submissions;
   DROP TABLE decision_card_versions;
   DROP TABLE decision_cards;
+`;
+
+/** Agent history lookups include archived Jobs; the active-only index cannot serve them. */
+export const V28_JOB_HISTORY_INDEX_MIGRATION_SCHEMA = `
+  CREATE INDEX IF NOT EXISTS jobs_agent_recent_history
+    ON jobs(agent_id, created_at DESC, updated_at DESC, job_id DESC);
 `;

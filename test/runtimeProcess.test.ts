@@ -140,6 +140,12 @@ async function waitUntilCapacity(baseUrl: string, timeoutMs = 8_000): Promise<Re
   throw new Error(`Runtime did not report capacity: ${await response?.text()}`);
 }
 
+async function observedStateInFlight(baseUrl: string): Promise<number | undefined> {
+  const response = await fetch(`${baseUrl}/readyz`);
+  const body = await response.json() as { stateService?: { inFlight?: number } };
+  return body.stateService?.inFlight;
+}
+
 async function waitForRuntimeHealth(
   applicationService: BridgeHttpServer["applicationService"],
   stateStatus: string,
@@ -384,8 +390,7 @@ describe("isolated production runtime", () => {
     const locker = new Database(databaseFile);
     locker.exec("BEGIN IMMEDIATE");
 
-    try {
-      const mutation = runtime.server.applicationService.updateSettings({
+    const mutation = runtime.server.applicationService.updateSettings({
         expectedSettingsRevision: current.settings.settingsRevision,
         operation: {
           kind: "patch",
@@ -400,12 +405,17 @@ describe("isolated production runtime", () => {
           error: error instanceof Error ? error.message : String(error)
         })
       );
+    const queuedMcp = fetch(`${runtime.baseUrl}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: "queued-during-lock", method: "ping" })
+    });
+    let mutationSettled = false;
+    void mutation.then(() => { mutationSettled = true; });
 
-      expect(await mutation).toMatchObject({
-        ok: false,
-        error: expect.stringContaining("RUNTIME_RESPONSE_UNCONFIRMED")
-      });
-
+    try {
+      await new Promise(resolve => setTimeout(resolve, 2_400));
+      expect(mutationSettled).toBe(false);
       const livenessStartedAt = Date.now();
       const liveness = await fetch(`${runtime.baseUrl}/healthz`);
       expect(liveness.status).toBe(200);
@@ -417,29 +427,6 @@ describe("isolated production runtime", () => {
         ok: false,
         reason: "state-stale",
         limitations: ["state-write-unconfirmed"],
-        stateService: {
-          activeOperation: {
-            access: "write",
-            operation: "state-transaction",
-            phase: "write-lock-wait"
-          }
-        }
-      });
-
-      const degradedMcp = await fetch(`${runtime.baseUrl}/mcp`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: "{}"
-      });
-      expect(degradedMcp.status).toBe(503);
-      expect(degradedMcp.headers.get("retry-after")).toBe("1");
-      expect(await degradedMcp.json()).toMatchObject({
-        ok: false,
-        code: "RUNTIME_RESPONSE_UNCONFIRMED",
-        reason: "state-stale",
-        limitations: ["state-write-unconfirmed"],
-        retryable: true,
-        outcome: "not-observed",
         stateService: {
           activeOperation: {
             access: "write",
@@ -467,6 +454,9 @@ describe("isolated production runtime", () => {
       locker.close();
     }
 
+    expect(await mutation).toMatchObject({ ok: true });
+    const queuedResponse = await queuedMcp;
+    expect(queuedResponse.status).not.toBe(503);
     const recovered = await waitUntilReady(runtime.baseUrl);
     expect(await recovered.json()).toMatchObject({ ok: true, reason: "ready" });
     await expect(runtime.server.applicationService.settingsSnapshot()).resolves.toMatchObject({
@@ -491,8 +481,7 @@ describe("isolated production runtime", () => {
     const locker = new Database(path.join(root, "state.sqlite"));
     try {
       locker.exec("BEGIN IMMEDIATE");
-      try {
-        const mutation = runtime.applicationService.updateSettings({
+      const mutation = runtime.applicationService.updateSettings({
           expectedSettingsRevision: current.settings.settingsRevision,
           operation: {
             kind: "patch",
@@ -501,7 +490,8 @@ describe("isolated production runtime", () => {
             }
           }
         });
-        await expect(mutation).rejects.toThrow(/RUNTIME_RESPONSE_UNCONFIRMED/);
+      try {
+        await new Promise(resolve => setTimeout(resolve, 2_400));
         expect(runtime.applicationService.runtimeHealth?.()).toMatchObject({
           acceptingNewJobs: false,
           stateService: {
@@ -513,6 +503,9 @@ describe("isolated production runtime", () => {
         locker.exec("ROLLBACK");
         locker.close();
       }
+      await expect(mutation).resolves.toMatchObject({
+        settings: { settingsRevision: current.settings.settingsRevision + 1 }
+      });
 
       await waitForRuntimeHealth(runtime.applicationService, "ready");
       expect(processIds).toHaveLength(1);
@@ -742,7 +735,7 @@ describe("isolated production runtime", () => {
     20_000
   );
 
-  it("reports unknown only after the current MCP request crosses the runtime boundary", async () => {
+  it("preserves a forwarded MCP request through a stale heartbeat", async () => {
     const processIds: number[] = [];
     const runtime = await start(
       processId => processIds.push(processId),
@@ -772,19 +765,16 @@ describe("isolated production runtime", () => {
     try {
       process.kill(processIds[0]!, "SIGSTOP");
       stopped = true;
-      const response = await pending;
-      expect(response.status).toBe(503);
-      await expect(response.json()).resolves.toMatchObject({
-        code: "RUNTIME_RESPONSE_UNCONFIRMED",
-        reason: "state-stale",
-        limitations: ["state-response-unconfirmed"],
-        retryable: true,
-        outcome: "unknown"
-      });
+      let settled = false;
+      void pending.then(() => { settled = true; }, () => { settled = true; });
+      await new Promise(resolve => setTimeout(resolve, 2_400));
+      expect(settled).toBe(false);
+      expect(await fetch(`${runtime.baseUrl}/readyz`).then(response => response.status)).toBe(503);
     } finally {
       if (stopped) process.kill(processIds[0]!, "SIGCONT");
     }
 
+    expect((await pending).status).toBe(200);
     await waitUntilReady(runtime.baseUrl);
   }, 15_000);
 
@@ -899,10 +889,93 @@ describe("isolated production runtime", () => {
         retryable: true,
         outcome: "not-observed"
       });
+
+      const identified = await fetch(`${runtime.baseUrl}/mcp`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0", id: "capacity-identified", method: "tools/call",
+          params: { name: "codex_status", arguments: {} }
+        })
+      });
+      expect(identified.status).toBe(503);
+      await expect(identified.json()).resolves.toMatchObject({
+        jsonrpc: "2.0", id: "capacity-identified",
+        error: { code: -32000, data: {
+          code: "RUNTIME_RESPONSE_UNCONFIRMED",
+          reason: "state-capacity", outcome: "not-observed"
+        } }
+      });
     } finally {
       for (const socket of sockets) socket.destroy();
     }
   }, 20_000);
+
+  it("releases the HTTP observer when a complete caller disconnects", async () => {
+    const runtime = await start(undefined, undefined, {
+      NODE_ENV: "test",
+      CODEX_MCP_BRIDGE_TEST_CONFORMANCE_DELAY_MS: "5000"
+    }, true);
+    const controller = new AbortController();
+    const pending = fetch(`${runtime.baseUrl}/mcp`, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        "mcp-protocol-version": CURRENT_PROTOCOL,
+        "mcp-method": "tools/call",
+        "mcp-name": "test_logging_tool"
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: "disconnect-after-body", method: "tools/call",
+        params: { name: "test_logging_tool", arguments: {} }
+      }),
+      signal: controller.signal
+    });
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      if ((await observedStateInFlight(runtime.baseUrl) || 0) === 1) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    expect(await observedStateInFlight(runtime.baseUrl)).toBe(1);
+    controller.abort();
+    await expect(pending).rejects.toThrow();
+    const releaseDeadline = Date.now() + 2_000;
+    while (Date.now() < releaseDeadline &&
+      (await observedStateInFlight(runtime.baseUrl) || 0) !== 0) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    expect(await observedStateInFlight(runtime.baseUrl)).toBe(0);
+  }, 12_000);
+
+  it("keeps timed-out native requests reserved until their physical responses arrive", async () => {
+    const processIds: number[] = [];
+    const runtime = await start(processId => processIds.push(processId), undefined, {
+      NODE_ENV: "test",
+      CODEX_MCP_BRIDGE_TEST_RPC_OBSERVATION_TIMEOUT_MS: "250"
+    });
+    expect(processIds).toHaveLength(1);
+    process.kill(processIds[0]!, "SIGSTOP");
+    try {
+      const first = Array.from({ length: 128 }, () =>
+        runtime.server.applicationService.settingsSnapshot().catch(error => error)
+      );
+      const settled = await Promise.all(first);
+      expect(settled.every(value => value instanceof Error &&
+        value.message.includes("RUNTIME_RESPONSE_UNCONFIRMED"))).toBe(true);
+      expect(await observedStateInFlight(runtime.baseUrl)).toBe(128);
+      await expect(runtime.server.applicationService.settingsSnapshot())
+        .rejects.toThrow(/RUNTIME_CAPACITY/);
+    } finally {
+      process.kill(processIds[0]!, "SIGCONT");
+    }
+    const releaseDeadline = Date.now() + 8_000;
+    while (Date.now() < releaseDeadline &&
+      (await observedStateInFlight(runtime.baseUrl) || 0) !== 0) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    expect(await observedStateInFlight(runtime.baseUrl)).toBe(0);
+  }, 15_000);
 
   it("keeps public liveness responsive while bounded large MCP payloads are parsed", async () => {
     const runtime = await start();

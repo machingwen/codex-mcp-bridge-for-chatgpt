@@ -2185,7 +2185,9 @@ export class CodexJobRegistry {
     string,
     { launch(): void; discard(): void }
   >();
-  private readonly changeListeners = new Set<() => void>();
+  private readonly changeListeners = new Set<(
+    reason?: CodexJobWakeReason, agentId?: string
+  ) => void>();
   private threadController?: ThreadConnectionController;
   private maintenanceScheduler?: StateMaintenanceScheduler;
   private recoveryController?: AutomaticRecoveryController;
@@ -2208,7 +2210,9 @@ export class CodexJobRegistry {
     if (this.projectionOnly) return;
     if (this.recoveryController) return;
     this.recoveryController = new AutomaticRecoveryController(this.activityStore.automaticRecovery, options);
-    this.unsubscribeRecovery = this.subscribeChanges(() => this.recoveryController?.schedule());
+    this.unsubscribeRecovery = this.subscribeChanges((reason, agentId) => {
+      if (reason !== "progress") this.recoveryController?.schedule(agentId);
+    });
     this.recoveryController.start();
   }
 
@@ -2260,7 +2264,7 @@ export class CodexJobRegistry {
     return current;
   }
 
-  subscribeChanges(listener: () => void): () => void {
+  subscribeChanges(listener: (reason?: CodexJobWakeReason, agentId?: string) => void): () => void {
     this.changeListeners.add(listener);
     return () => { this.changeListeners.delete(listener); };
   }
@@ -4060,7 +4064,7 @@ export class CodexJobRegistry {
       ? "terminal"
       : reason;
     if (current) this.lastWake.set(jobId, { version: current.version, reason: effectiveReason });
-    for (const listener of this.changeListeners) listener();
+    for (const listener of this.changeListeners) listener(effectiveReason, current?.agentId);
     for (const listener of [...(this.waiters.get(jobId) || [])]) listener(effectiveReason);
     if (effectiveReason === "terminal") {
       for (const listener of [...(this.terminalWaiters.get(jobId) || [])]) listener();
@@ -8362,26 +8366,53 @@ function configureAutomaticRecovery(
   acceptingNewJobs: () => boolean
 ): void {
   const store = jobs.admissionStateStore;
-  const candidates = (): AutomaticRecoveryCandidate[] => {
+  const candidates = async (agentId?: string): Promise<AutomaticRecoveryCandidate[]> => {
     if (!acceptingNewJobs() || jobs.runtimeAdmission.pendingAdmissions > 0) return [];
     const latestByAgent = new Map<string, CodexJob>();
-    for (const job of jobs.list(jobs.size)) {
+    const listedJobs = agentId ? jobs.listForAgent(agentId) : jobs.list(jobs.size);
+    const jobsById = new Map(listedJobs.map(job => [job.jobId, job]));
+    for (const job of listedJobs) {
       if (!job.agentId) continue;
       const previous = latestByAgent.get(job.agentId);
       if (!previous || job.createdAt > previous.createdAt) latestByAgent.set(job.agentId, job);
     }
+    const blockedKeys = store.automaticRecovery.blockedKeys();
+    const blockedRecheckIdentities = store.automaticRecovery.blockedRecheckIdentityKeys();
+    const connectionsByAgent = new Map<string, ThreadConnectionRecord[]>();
+    for (const connection of store.threadConnections.list()) {
+      if (!connection.agentId || connection.persistence !== "persistent" ||
+          !connection.lastJobId || ["released", "releasing"].includes(connection.phase)) continue;
+      const entries = connectionsByAgent.get(connection.agentId) || [];
+      entries.push(connection);
+      connectionsByAgent.set(connection.agentId, entries);
+    }
     const result: AutomaticRecoveryCandidate[] = [];
-    for (const agent of listAllDashboardAgents(jobs)) {
+    let scanned = 0;
+    const agents = agentId ? [jobs.getAgent(agentId)].filter(
+      (agent): agent is BridgeAgent => agent !== undefined
+    ) : listAllDashboardAgents(jobs);
+    for (const agent of agents) {
+      // The full fallback survey yields frequently enough for status reads and
+      // heartbeats. Blocked incidents do not need their old work rehydrated.
+      if (++scanned % 16 === 0) await new Promise<void>(resolve => setImmediate(resolve));
+      const latest = latestByAgent.get(agent.agentId);
+      const current = agent.currentJobId ? jobsById.get(agent.currentJobId) : undefined;
+      const recheckIdentity = recheckRecoveryIdentity(jobs, agent, latest);
+      const couldRelease = (connectionsByAgent.get(agent.agentId) || []).some(connection =>
+        connection.lastJobId && !blockedKeys.has(automaticRecoveryKey("release",
+          [connection.threadId,connection.lastJobId])));
+      if (blockedRecheckIdentities.has(recheckIdentity.key) && !couldRelease &&
+          current?.status !== "termination-failed") continue;
       const thread = jobs.listAgentThreads(agent.agentId).find(thread => thread.isCurrent);
       if (!thread || thread.backendKind !== "app-server") continue;
-      const current = agent.currentJobId ? jobs.get(agent.currentJobId) : undefined;
-      const latest = latestByAgent.get(agent.agentId);
       if (current?.status === "termination-failed" && current.cancellationIntentId) {
         const intent = jobs.getCancellationIntent(current.cancellationIntentId);
         if (intent?.status === "failed" && intent.targetJobId === current.jobId && intent.scopeId === agent.scopeId &&
           intent.source !== "assignment-containment" && current.upstreamRequestId && current.workerId && current.workerGeneration !== undefined &&
           intent.targetTurnId === current.upstreamRequestId && intent.targetThreadId === current.threadId) {
-          result.push({key:automaticRecoveryKey("retry-stop",[current.jobId,current.workerId,current.workerGeneration,current.upstreamRequestId,current.cancelRequestedAt]),
+          const key = automaticRecoveryKey("retry-stop",
+            [current.jobId,current.workerId,current.workerGeneration,current.upstreamRequestId,current.cancelRequestedAt]);
+          if (!blockedKeys.has(key)) result.push({key,
             scopeId:agent.scopeId,agentId:agent.agentId,jobId:current.jobId,kind:"retry-stop"});
         }
         continue;
@@ -8393,21 +8424,25 @@ function configureAutomaticRecovery(
       const unresolvedOrphan = agent.lifecycle === "orphaned" && !store.workHistory.runtimeResolution(agent.agentId,identity.revision);
       // A new incident opens only on a fresh failed inspection. Cached unknown
       // state cannot reopen a verified incident or reset its attempt budget.
-      const recheck = store.automaticRecovery.recheckCandidate(recheckRecoveryIdentity(jobs,agent,latest),Boolean(unknown || unresolvedOrphan));
-      if (recheck) result.push(recheck);
-      const connection = store.threadConnections.get(thread.threadId);
-      const retained = store.workHistory.latestJob(agent.agentId);
+      const recheck = store.automaticRecovery.recheckCandidate(recheckIdentity,Boolean(unknown || unresolvedOrphan));
+      if (recheck && !blockedKeys.has(recheck.key)) result.push(recheck);
+      const connection = (connectionsByAgent.get(agent.agentId) || [])
+        .find(connection => connection.threadId === thread.threadId);
+      const retained = connection && !current ? store.workHistory.latestJob(agent.agentId) : undefined;
       if (!current && connection?.persistence === "persistent" && connection.lastJobId && !["released","releasing"].includes(connection.phase) &&
         retained?.jobId === connection.lastJobId && ["failed","interrupted","cancelled"].includes(retained.status) &&
         !store.threadConnections.hasUnfinishedWork(thread.threadId)) {
-        result.push({key:automaticRecoveryKey("release",[thread.threadId,connection.lastJobId]),
+        const key = automaticRecoveryKey("release",[thread.threadId,connection.lastJobId]);
+        if (!blockedKeys.has(key)) result.push({key,
           scopeId:agent.scopeId,agentId:agent.agentId,jobId:connection.lastJobId,kind:"release"});
       }
     }
     return result;
   };
   const attempt = async (candidate: AutomaticRecoveryCandidate): Promise<AutomaticRecoveryResult> => {
-    if (!candidates().some(current => current.key === candidate.key)) return {resolved:false,reason:"work-changed",retryable:false};
+    if (!(await candidates(candidate.agentId)).some(current => current.key === candidate.key)) {
+      return {resolved:false,reason:"work-changed",retryable:false};
+    }
     const agent = jobs.getAgent(candidate.agentId)!;
     const thread = jobs.listAgentThreads(agent.agentId).find(thread => thread.isCurrent)!;
     if (candidate.kind === "retry-stop") {
@@ -8446,7 +8481,7 @@ function configureAutomaticRecovery(
     if (!connection || connection.scopeId !== agent.scopeId || connection.persistence !== "persistent" || !upstream.releaseThreadConnection) {
       return {resolved:false,reason:"release-unavailable",retryable:false};
     }
-    const eligible = new Map(candidates().filter(item => item.kind === "release").flatMap(item => {
+    const eligible = new Map((await candidates()).filter(item => item.kind === "release").flatMap(item => {
       const owner = jobs.getAgent(item.agentId), currentThread = jobs.listAgentThreads(item.agentId).find(thread => thread.isCurrent);
       const connection = currentThread ? store.threadConnections.get(currentThread.threadId) : undefined;
       return owner && connection ? [[connection.threadId,{candidate:item,agent:owner,connection}] as const] : [];
