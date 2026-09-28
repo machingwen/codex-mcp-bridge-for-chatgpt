@@ -166,7 +166,8 @@ export const THREAD_UNFINISHED_WORK_SQL = `WITH candidate_jobs AS (
   SELECT job_id,activity_id,status FROM jobs
    WHERE source_thread_id=? AND archived_at IS NULL
   UNION ALL
-  SELECT job_id,activity_id,status FROM jobs
+  -- The history index includes archived Jobs; release eligibility only reads active Jobs.
+  SELECT job_id,activity_id,status FROM jobs INDEXED BY jobs_agent_active
    WHERE agent_id=(SELECT agent_id FROM thread_connections WHERE thread_id=?)
      AND archived_at IS NULL
 )

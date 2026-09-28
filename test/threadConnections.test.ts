@@ -1,9 +1,10 @@
 import { mkdtempSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { BridgeStateStore } from "../src/stateStore.js";
-import { DEFAULT_THREAD_IDLE_MS, ThreadConnectionController, type ThreadReleaseOptions, type ThreadReleaseResult } from "../src/threadConnections.js";
+import { DEFAULT_THREAD_IDLE_MS, THREAD_UNFINISHED_WORK_SQL, ThreadConnectionController, type ThreadReleaseOptions, type ThreadReleaseResult } from "../src/threadConnections.js";
 import type { CodexUpstream } from "../src/upstream.js";
 import { loadConfig } from "../src/config.js";
 
@@ -19,6 +20,21 @@ function fake(release: (threadId: string, options: ThreadReleaseOptions) => Prom
 }
 
 describe("durable thread connection lifetime", () => {
+  it("keeps unfinished Agent work on the active-only index after adding the history index", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "thread-active-plan-"));
+    const file = path.join(root, "state.sqlite");
+    new BridgeStateStore({ file }).close();
+    const database = new Database(file, { readonly: true });
+    try {
+      const plan = database.prepare(`EXPLAIN QUERY PLAN ${THREAD_UNFINISHED_WORK_SQL}`)
+        .all("thread", "thread", "thread")
+        .map(row => String((row as { detail: string }).detail));
+      expect(plan).toContainEqual(expect.stringContaining("jobs_agent_active"));
+    } finally {
+      database.close();
+    }
+  });
+
   it("finds unfinished work through each indexed thread, source, and Agent identity", () => {
     const store = new BridgeStateStore({ file: ":memory:" });
     store.upsertJob(job("direct-thread"));
