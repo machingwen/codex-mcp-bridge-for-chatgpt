@@ -236,7 +236,7 @@
       "fromSchema": 27,
       "toSchema": 28,
       "implementation": "migrateV27ToV28",
-      "introducedCommit": "0000000000000000000000000000000000000000",
+      "introducedCommit": "4c82f267886df895c06b425b7f349c6ff5534fd9",
       "sha256": "feacf67a87491a8d444ecadedb42e906ddbc3ddfb6ed39bd0af1a3cf7001d63a"
     }
   ],
